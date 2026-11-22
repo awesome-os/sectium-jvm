@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -18,7 +18,7 @@
 /* ---- Timing ---- */
 
 int64_t b8g_jvm_nanotime(void) {
-#ifdef _WIN32
+#if defined(_WIN32)
   static LARGE_INTEGER freq = {0};
   LARGE_INTEGER counter;
   if (freq.QuadPart == 0) {
@@ -30,6 +30,12 @@ int64_t b8g_jvm_nanotime(void) {
   int64_t secs = counter.QuadPart / freq.QuadPart;
   int64_t rem = counter.QuadPart % freq.QuadPart;
   return secs * 1000000000LL + (rem * 1000000000LL) / freq.QuadPart;
+#elif defined(__wasi__)
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+  }
+  return 0;
 #else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -480,6 +486,103 @@ void b8g_jvm_vm_free(b8g_jvm_vm_t *vm) {
     cur = next;
   }
   vm->heap_head = NULL;
+  free(vm->objects);
+  vm->objects = NULL;
+  vm->obj_count = 0;
+  vm->static_count = 0;
+}
+
+static uintptr_t vm_alloc_object(b8g_jvm_vm_t *vm, uint16_t class_idx) {
+  if (!vm->objects) {
+    vm->objects =
+        (b8g_jvm_obj_t *)calloc(B8G_JVM_MAX_OBJECTS, sizeof(b8g_jvm_obj_t));
+    if (!vm->objects) {
+      set_err(vm->err, sizeof(vm->err), "OutOfMemoryError (object arena)");
+      return 0;
+    }
+  }
+  if (vm->obj_count >= B8G_JVM_MAX_OBJECTS) {
+    set_err(vm->err, sizeof(vm->err), "OutOfMemoryError (max %d objects)",
+            B8G_JVM_MAX_OBJECTS);
+    return 0;
+  }
+  uint32_t id = ++vm->obj_count; /* 1-based handle so 0 == null */
+  b8g_jvm_obj_t *obj = &vm->objects[id - 1];
+  memset(obj, 0, sizeof(*obj));
+  obj->class_idx = class_idx;
+  return (uintptr_t)id;
+}
+
+static int vm_putfield(b8g_jvm_vm_t *vm, void *ref, uint16_t field_cp_idx,
+                       int64_t val) {
+  uintptr_t id = (uintptr_t)ref;
+  if (id == 0 || id > vm->obj_count || !vm->objects) {
+    set_err(vm->err, sizeof(vm->err), "NullPointerException in putfield #%u",
+            field_cp_idx);
+    return -1;
+  }
+  b8g_jvm_obj_t *obj = &vm->objects[id - 1];
+  for (uint8_t i = 0; i < obj->field_count; i++) {
+    if (obj->field_keys[i] == field_cp_idx) {
+      obj->field_vals[i] = val;
+      return 0;
+    }
+  }
+  if (obj->field_count >= B8G_JVM_MAX_OBJ_FIELDS) {
+    set_err(vm->err, sizeof(vm->err), "object field limit (%d) exceeded",
+            B8G_JVM_MAX_OBJ_FIELDS);
+    return -1;
+  }
+  uint8_t slot = obj->field_count++;
+  obj->field_keys[slot] = field_cp_idx;
+  obj->field_vals[slot] = val;
+  return 0;
+}
+
+static int vm_getfield(b8g_jvm_vm_t *vm, void *ref, uint16_t field_cp_idx,
+                       int64_t *out_val) {
+  uintptr_t id = (uintptr_t)ref;
+  if (id == 0 || id > vm->obj_count || !vm->objects) {
+    set_err(vm->err, sizeof(vm->err), "NullPointerException in getfield #%u",
+            field_cp_idx);
+    return -1;
+  }
+  b8g_jvm_obj_t *obj = &vm->objects[id - 1];
+  for (uint8_t i = 0; i < obj->field_count; i++) {
+    if (obj->field_keys[i] == field_cp_idx) {
+      *out_val = obj->field_vals[i];
+      return 0;
+    }
+  }
+  *out_val = 0;
+  return 0;
+}
+
+static int vm_putstatic(b8g_jvm_vm_t *vm, uint16_t field_cp_idx, int64_t val) {
+  for (uint16_t i = 0; i < vm->static_count; i++) {
+    if (vm->statics[i].key == field_cp_idx) {
+      vm->statics[i].val = val;
+      return 0;
+    }
+  }
+  if (vm->static_count >= B8G_JVM_MAX_STATICS) {
+    set_err(vm->err, sizeof(vm->err), "static field limit (%d) exceeded",
+            B8G_JVM_MAX_STATICS);
+    return -1;
+  }
+  vm->statics[vm->static_count].key = field_cp_idx;
+  vm->statics[vm->static_count].val = val;
+  vm->static_count++;
+  return 0;
+}
+
+static int64_t vm_getstatic(b8g_jvm_vm_t *vm, uint16_t field_cp_idx) {
+  for (uint16_t i = 0; i < vm->static_count; i++) {
+    if (vm->statics[i].key == field_cp_idx) {
+      return vm->statics[i].val;
+    }
+  }
+  return 0;
 }
 
 static b8g_array_t *vm_alloc_array(b8g_jvm_vm_t *vm, uint8_t atype,
@@ -582,18 +685,24 @@ int b8g_jvm_exec_method(b8g_jvm_vm_t *vm, const b8g_method_t *m,
     heap_stack = 1;
   }
 
-  /* Copy arguments into local slots (respecting 2-slot long/double) */
+  /* Copy arguments into local slots (respecting 2-slot long/double and 'this') */
   char arg_types[64];
   char ret_type = 'V';
   int desc_argc = b8g_jvm_desc_arg_info(m->desc, arg_types, 64, &ret_type);
+  int is_static = (m->access_flags & JVM_ACC_STATIC) != 0;
   int slot = 0;
   for (int i = 0; i < arg_count && slot < (int)nlocals; i++) {
     locals[slot] = args[i];
-    if (desc_argc > 0 && i < desc_argc &&
-        (arg_types[i] == 'J' || arg_types[i] == 'D')) {
-      slot += 2;
-    } else {
+    if (!is_static && i == 0) {
       slot += 1;
+    } else {
+      int di = is_static ? i : (i - 1);
+      if (desc_argc > 0 && di >= 0 && di < desc_argc &&
+          (arg_types[di] == 'J' || arg_types[di] == 'D')) {
+        slot += 2;
+      } else {
+        slot += 1;
+      }
     }
   }
 
@@ -1063,7 +1172,83 @@ int b8g_jvm_exec_method(b8g_jvm_vm_t *vm, const b8g_method_t *m,
         if (strcmp(cn, "java/lang/System") == 0 && strcmp(fn, "out") == 0) {
           PUSH_REF(JVM_SYSTEM_OUT_REF);
         } else {
-          set_err(vm->err, sizeof(vm->err), "unsupported getstatic %s.%s", cn, fn);
+          int64_t val = vm_getstatic(vm, idx);
+          if (fd[0] == 'J' || fd[0] == 'D') {
+            PUSH_I64(val);
+          } else if (fd[0] == 'L' || fd[0] == '[') {
+            PUSH_REF((void *)(uintptr_t)val);
+          } else {
+            PUSH_I32((int32_t)val);
+          }
+        }
+        break;
+      }
+      case 0xb3: { /* putstatic */
+        uint16_t idx = read_u16(code, pc);
+        pc += 2;
+        const char *cn = NULL, *fn = NULL, *fd = NULL;
+        if (b8g_jvm_cp_member(cls, idx, &cn, &fn, &fd) != 0) {
+          set_err(vm->err, sizeof(vm->err), "bad putstatic #%u", idx);
+          status = -1;
+          goto done;
+        }
+        int64_t val = 0;
+        if (fd[0] == 'J' || fd[0] == 'D') {
+          val = POP_I64();
+        } else if (fd[0] == 'L' || fd[0] == '[') {
+          val = (int64_t)(uintptr_t)POP_REF();
+        } else {
+          val = (int64_t)POP_I32();
+        }
+        if (vm_putstatic(vm, idx, val) != 0) {
+          status = -1;
+          goto done;
+        }
+        break;
+      }
+      case 0xb4: { /* getfield */
+        uint16_t idx = read_u16(code, pc);
+        pc += 2;
+        const char *cn = NULL, *fn = NULL, *fd = NULL;
+        if (b8g_jvm_cp_member(cls, idx, &cn, &fn, &fd) != 0) {
+          set_err(vm->err, sizeof(vm->err), "bad getfield #%u", idx);
+          status = -1;
+          goto done;
+        }
+        void *objref = POP_REF();
+        int64_t val = 0;
+        if (vm_getfield(vm, objref, idx, &val) != 0) {
+          status = -1;
+          goto done;
+        }
+        if (fd[0] == 'J' || fd[0] == 'D') {
+          PUSH_I64(val);
+        } else if (fd[0] == 'L' || fd[0] == '[') {
+          PUSH_REF((void *)(uintptr_t)val);
+        } else {
+          PUSH_I32((int32_t)val);
+        }
+        break;
+      }
+      case 0xb5: { /* putfield */
+        uint16_t idx = read_u16(code, pc);
+        pc += 2;
+        const char *cn = NULL, *fn = NULL, *fd = NULL;
+        if (b8g_jvm_cp_member(cls, idx, &cn, &fn, &fd) != 0) {
+          set_err(vm->err, sizeof(vm->err), "bad putfield #%u", idx);
+          status = -1;
+          goto done;
+        }
+        int64_t val = 0;
+        if (fd[0] == 'J' || fd[0] == 'D') {
+          val = POP_I64();
+        } else if (fd[0] == 'L' || fd[0] == '[') {
+          val = (int64_t)(uintptr_t)POP_REF();
+        } else {
+          val = (int64_t)POP_I32();
+        }
+        void *objref = POP_REF();
+        if (vm_putfield(vm, objref, idx, val) != 0) {
           status = -1;
           goto done;
         }
@@ -1111,6 +1296,52 @@ int b8g_jvm_exec_method(b8g_jvm_vm_t *vm, const b8g_method_t *m,
         }
         break;
       }
+      case 0xb7: { /* invokespecial */
+        uint16_t idx = read_u16(code, pc);
+        pc += 2;
+        const char *cn = NULL, *mn = NULL, *md = NULL;
+        if (b8g_jvm_cp_member(cls, idx, &cn, &mn, &md) != 0) {
+          set_err(vm->err, sizeof(vm->err), "bad invokespecial #%u", idx);
+          status = -1;
+          goto done;
+        }
+        char c_arg_types[64];
+        char c_ret = 'V';
+        int c_argc = b8g_jvm_desc_arg_info(md, c_arg_types, 64, &c_ret);
+        if (c_argc < 0 || c_argc > 63) {
+          set_err(vm->err, sizeof(vm->err), "invalid descriptor %s", md);
+          status = -1;
+          goto done;
+        }
+        b8g_val_t call_args[64];
+        for (int a = c_argc; a >= 1; a--) {
+          call_args[a] = stack[--sp];
+        }
+        call_args[0] = stack[--sp]; /* receiver objref */
+        if (strcmp(cn, "java/lang/Object") == 0 && strcmp(mn, "<init>") == 0) {
+          break;
+        }
+        const b8g_method_t *target = b8g_jvm_find_method(cls, mn, md);
+        if (target && target->has_code) {
+          b8g_val_t call_ret;
+          call_ret.i64 = 0;
+          if (b8g_jvm_exec_method(vm, target, call_args, c_argc + 1,
+                                  &call_ret) != 0) {
+            status = -1;
+            goto done;
+          }
+          if (c_ret != 'V') {
+            stack[sp++] = call_ret;
+          }
+        } else if (strcmp(mn, "<init>") == 0) {
+          /* External / default constructor no-op */
+        } else {
+          set_err(vm->err, sizeof(vm->err), "MethodNotFound: %s.%s%s", cn, mn, md);
+          status = -1;
+          goto done;
+        }
+        break;
+      }
       case 0xb8: { /* invokestatic */
         uint16_t idx = read_u16(code, pc);
         pc += 2;
@@ -1129,6 +1360,27 @@ int b8g_jvm_exec_method(b8g_jvm_vm_t *vm, const b8g_method_t *m,
             strcmp(mn, "currentTimeMillis") == 0 && strcmp(md, "()J") == 0) {
           PUSH_I64(b8g_jvm_nanotime() / 1000000LL);
           break;
+        }
+        if (strcmp(cn, "kotlin/jvm/internal/Intrinsics") == 0) {
+          if ((strcmp(mn, "checkNotNullParameter") == 0 ||
+               strcmp(mn, "checkNotNullExpressionValue") == 0) &&
+              strcmp(md, "(Ljava/lang/Object;Ljava/lang/String;)V") == 0) {
+            (void)POP_REF();
+            (void)POP_REF();
+            break;
+          }
+          if (strcmp(mn, "checkNotNull") == 0 &&
+              strcmp(md, "(Ljava/lang/Object;)V") == 0) {
+            (void)POP_REF();
+            break;
+          }
+          if (strcmp(mn, "areEqual") == 0 &&
+              strcmp(md, "(Ljava/lang/Object;Ljava/lang/Object;)Z") == 0) {
+            void *b = POP_REF();
+            void *a = POP_REF();
+            PUSH_I32(a == b ? 1 : 0);
+            break;
+          }
         }
         const b8g_method_t *target = b8g_jvm_find_method(cls, mn, md);
         if (!target) {
@@ -1157,6 +1409,17 @@ int b8g_jvm_exec_method(b8g_jvm_vm_t *vm, const b8g_method_t *m,
         if (c_ret != 'V') {
           stack[sp++] = call_ret;
         }
+        break;
+      }
+      case 0xbb: { /* new */
+        uint16_t class_idx = read_u16(code, pc);
+        pc += 2;
+        uintptr_t handle = vm_alloc_object(vm, class_idx);
+        if (!handle) {
+          status = -1;
+          goto done;
+        }
+        PUSH_REF((void *)handle);
         break;
       }
 

@@ -162,7 +162,17 @@ static int insn_info(const b8g_jvm_class_t *cls, const uint8_t *code,
     case 0xb2: /* getstatic */
       len = 3; pushes = 1; wide = 1;
       break;
-    case 0xb6: /* invokevirtual */ {
+    case 0xb3: /* putstatic */
+      len = 3; pops = 1; wide = 1;
+      break;
+    case 0xb4: /* getfield */
+      len = 3; pops = 1; pushes = 1; wide = 1;
+      break;
+    case 0xb5: /* putfield */
+      len = 3; pops = 2; wide = 1;
+      break;
+    case 0xb6: /* invokevirtual */
+    case 0xb7: /* invokespecial */ {
       len = 3; wide = 1;
       uint16_t idx = aot_u16(code, pc + 1);
       const char *cn = NULL, *mn = NULL, *md = NULL;
@@ -190,6 +200,9 @@ static int insn_info(const b8g_jvm_class_t *cls, const uint8_t *code,
       }
       break;
     }
+    case 0xbb: /* new */
+      len = 3; pushes = 1; wide = 1;
+      break;
     case 0xbc: /* newarray */
       len = 2; pops = 1; pushes = 1; wide = 1;
       break;
@@ -230,17 +243,25 @@ static int emit_method_sig(const b8g_jvm_class_t *cls, uint16_t midx,
   int argc = b8g_jvm_desc_arg_info(m->desc, arg_types, 64, &ret_type);
   if (argc < 0) return -1;
 
+  int is_static = (m->access_flags & JVM_ACC_STATIC) != 0;
   char cname[128];
   sanitize_method_name(cls, midx, cname, sizeof(cname));
   fprintf(out, "static %s %s(", c_type_for_desc(ret_type), cname);
-  if (argc == 0) {
+  if (is_static && argc == 0) {
     fputs("void", out);
   } else {
     int slot = 0;
+    int emitted = 0;
+    if (!is_static) {
+      fputs("int64_t l0", out);
+      slot = 1;
+      emitted = 1;
+    }
     for (int i = 0; i < argc; i++) {
-      if (i > 0) fputs(", ", out);
+      if (emitted > 0) fputs(", ", out);
       fprintf(out, "%s l%d", c_type_for_desc(arg_types[i]), slot);
       slot += (arg_types[i] == 'J' || arg_types[i] == 'D') ? 2 : 1;
+      emitted++;
     }
   }
   fprintf(out, ")%s\n", is_decl ? ";" : " {");
@@ -280,7 +301,12 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
   char arg_types[64];
   char ret_type = 'V';
   int argc = b8g_jvm_desc_arg_info(m->desc, arg_types, 64, &ret_type);
+  int is_static = (m->access_flags & JVM_ACC_STATIC) != 0;
   int param_slots = 0;
+  if (!is_static) {
+    local_types[0] = 'J';
+    param_slots = 1;
+  }
   for (int i = 0; i < argc; i++) {
     if (param_slots < (int)nlocals) {
       local_types[param_slots] = (arg_types[i] == 'I') ? 'I' : 'J';
@@ -351,9 +377,13 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
   /* Emit signature */
   emit_method_sig(cls, midx, out, 0);
 
-  /* Silence unused parameter warnings for main(args) etc. */
+  /* Silence unused parameter warnings for main(args) / <init>(this) etc. */
   {
     int slot = 0;
+    if (!is_static) {
+      fputs("  (void)l0;\n", out);
+      slot = 1;
+    }
     for (int i = 0; i < argc; i++) {
       fprintf(out, "  (void)l%d;\n", slot);
       slot += (arg_types[i] == 'J' || arg_types[i] == 'D') ? 2 : 1;
@@ -548,10 +578,33 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
       case 0xb0: fprintf(out, "  return (int64_t)s%d;\n", d - 1); break;
       case 0xb1: fputs("  return;\n", out); break;
 
-      /* Calls */
-      case 0xb2: /* getstatic */
-        fprintf(out, "  s%d = 0;\n", d);
+      /* Calls & Fields */
+      case 0xb2: { /* getstatic */
+        uint16_t idx = aot_u16(code, pc + 1);
+        const char *cn = NULL, *fn = NULL, *fd = NULL;
+        if (b8g_jvm_cp_member(cls, idx, &cn, &fn, &fd) == 0 &&
+            strcmp(cn, "java/lang/System") == 0 && strcmp(fn, "out") == 0) {
+          fprintf(out, "  s%d = 0;\n", d);
+        } else {
+          fprintf(out, "  s%d = b8g_getstatic(%u);\n", d, idx);
+        }
         break;
+      }
+      case 0xb3: { /* putstatic */
+        uint16_t idx = aot_u16(code, pc + 1);
+        fprintf(out, "  b8g_putstatic(%u, (int64_t)s%d);\n", idx, d - 1);
+        break;
+      }
+      case 0xb4: { /* getfield */
+        uint16_t idx = aot_u16(code, pc + 1);
+        fprintf(out, "  s%d = b8g_getfield(s%d, %u);\n", d - 1, d - 1, idx);
+        break;
+      }
+      case 0xb5: { /* putfield */
+        uint16_t idx = aot_u16(code, pc + 1);
+        fprintf(out, "  b8g_putfield(s%d, %u, (int64_t)s%d);\n", d - 2, idx, d - 1);
+        break;
+      }
       case 0xb6: { /* invokevirtual */
         uint16_t idx = aot_u16(code, pc + 1);
         const char *cn = NULL, *mn = NULL, *md = NULL;
@@ -574,6 +627,41 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
         }
         break;
       }
+      case 0xb7: { /* invokespecial */
+        uint16_t idx = aot_u16(code, pc + 1);
+        const char *cn = NULL, *mn = NULL, *md = NULL;
+        b8g_jvm_cp_member(cls, idx, &cn, &mn, &md);
+        if (strcmp(cn, "java/lang/Object") == 0 && strcmp(mn, "<init>") == 0) {
+          break;
+        }
+        int tidx = find_method_index(cls, mn, md);
+        if (tidx >= 0 && cls->methods[tidx].has_code) {
+          char c_at[64], c_rt = 'V';
+          int c_argc = b8g_jvm_desc_arg_info(md, c_at, 64, &c_rt);
+          char cname[128];
+          sanitize_method_name(cls, (uint16_t)tidx, cname, sizeof(cname));
+          int base = d - (c_argc + 1);
+          if (c_rt == 'V') {
+            fprintf(out, "  %s((int64_t)s%d", cname, base);
+          } else {
+            fprintf(out, "  s%d = %s((int64_t)s%d", base, cname, base);
+          }
+          for (int a = 0; a < c_argc; a++) {
+            fprintf(out, ", (%s)s%d", c_type_for_desc(c_at[a]), base + 1 + a);
+          }
+          fputs(");\n", out);
+        } else if (strcmp(mn, "<init>") == 0) {
+          /* External / default constructor no-op */
+        } else {
+          aot_err(err, err_cap, "AOT unresolved invokespecial %s.%s%s", cn, mn, md);
+          free(local_types);
+          free(depth);
+          free(is_target);
+          free(worklist);
+          return -1;
+        }
+        break;
+      }
       case 0xb8: { /* invokestatic */
         uint16_t idx = aot_u16(code, pc + 1);
         const char *cn = NULL, *mn = NULL, *md = NULL;
@@ -581,6 +669,21 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
         if (strcmp(cn, "java/lang/System") == 0 &&
             strcmp(mn, "nanoTime") == 0) {
           fprintf(out, "  s%d = b8g_aot_nanotime();\n", d);
+        } else if (strcmp(cn, "java/lang/System") == 0 &&
+                   strcmp(mn, "currentTimeMillis") == 0) {
+          fprintf(out, "  s%d = b8g_aot_nanotime() / 1000000LL;\n", d);
+        } else if (strcmp(cn, "kotlin/jvm/internal/Intrinsics") == 0) {
+          if ((strcmp(mn, "checkNotNullParameter") == 0 ||
+               strcmp(mn, "checkNotNullExpressionValue") == 0) &&
+              strcmp(md, "(Ljava/lang/Object;Ljava/lang/String;)V") == 0) {
+            fprintf(out, "  (void)s%d; (void)s%d;\n", d - 2, d - 1);
+          } else if (strcmp(mn, "checkNotNull") == 0 &&
+                     strcmp(md, "(Ljava/lang/Object;)V") == 0) {
+            fprintf(out, "  (void)s%d;\n", d - 1);
+          } else if (strcmp(mn, "areEqual") == 0 &&
+                     strcmp(md, "(Ljava/lang/Object;Ljava/lang/Object;)Z") == 0) {
+            fprintf(out, "  s%d = (s%d == s%d) ? 1 : 0;\n", d - 2, d - 2, d - 1);
+          }
         } else {
           int tidx = find_method_index(cls, mn, md);
           if (tidx < 0) {
@@ -607,6 +710,11 @@ static int emit_method_body(const b8g_jvm_class_t *cls, uint16_t midx,
           }
           fputs(");\n", out);
         }
+        break;
+      }
+      case 0xbb: { /* new */
+        uint16_t class_idx = aot_u16(code, pc + 1);
+        fprintf(out, "  s%d = b8g_new_obj(%u);\n", d, class_idx);
         break;
       }
 
@@ -686,19 +794,66 @@ int b8g_jvm_emit_c(const b8g_jvm_class_t *cls, FILE *out,
   fputs("  a->len = n; a->i8 = (int8_t *)calloc(n > 0 ? (size_t)n : 1, 1);\n", out);
   fputs("  return a;\n}\n\n", out);
 
-  /* Forward declarations for static methods with Code */
+  fputs("typedef struct {\n", out);
+  fputs("  uint16_t class_idx;\n", out);
+  fputs("  uint8_t field_count;\n", out);
+  fputs("  uint16_t field_keys[16];\n", out);
+  fputs("  int64_t field_vals[16];\n", out);
+  fputs("} b8g_obj_t;\n", out);
+  fputs("static b8g_obj_t b8g_objs[4096];\n", out);
+  fputs("static uint32_t b8g_obj_count = 0;\n", out);
+  fputs("static inline int64_t b8g_new_obj(uint16_t cls_idx) {\n", out);
+  fputs("  if (b8g_obj_count >= 4096u) return 0;\n", out);
+  fputs("  uint32_t id = ++b8g_obj_count;\n", out);
+  fputs("  b8g_objs[id - 1].class_idx = cls_idx;\n", out);
+  fputs("  b8g_objs[id - 1].field_count = 0;\n", out);
+  fputs("  return (int64_t)id;\n}\n", out);
+  fputs("static inline void b8g_putfield(int64_t h, uint16_t k, int64_t v) {\n", out);
+  fputs("  if (h <= 0 || (uint32_t)h > b8g_obj_count) return;\n", out);
+  fputs("  b8g_obj_t *o = &b8g_objs[(uint32_t)h - 1];\n", out);
+  fputs("  for (uint8_t i = 0; i < o->field_count; i++) {\n", out);
+  fputs("    if (o->field_keys[i] == k) { o->field_vals[i] = v; return; }\n", out);
+  fputs("  }\n", out);
+  fputs("  if (o->field_count < 16) {\n", out);
+  fputs("    uint8_t s = o->field_count++; o->field_keys[s] = k; o->field_vals[s] = v;\n", out);
+  fputs("  }\n}\n", out);
+  fputs("static inline int64_t b8g_getfield(int64_t h, uint16_t k) {\n", out);
+  fputs("  if (h <= 0 || (uint32_t)h > b8g_obj_count) return 0;\n", out);
+  fputs("  b8g_obj_t *o = &b8g_objs[(uint32_t)h - 1];\n", out);
+  fputs("  for (uint8_t i = 0; i < o->field_count; i++) {\n", out);
+  fputs("    if (o->field_keys[i] == k) return o->field_vals[i];\n", out);
+  fputs("  }\n  return 0;\n}\n", out);
+  fputs("typedef struct { uint16_t key; int64_t val; } b8g_static_t;\n", out);
+  fputs("static b8g_static_t b8g_statics[256];\n", out);
+  fputs("static uint16_t b8g_static_count = 0;\n", out);
+  fputs("static inline void b8g_putstatic(uint16_t k, int64_t v) {\n", out);
+  fputs("  for (uint16_t i = 0; i < b8g_static_count; i++) {\n", out);
+  fputs("    if (b8g_statics[i].key == k) { b8g_statics[i].val = v; return; }\n", out);
+  fputs("  }\n", out);
+  fputs("  if (b8g_static_count < 256) {\n", out);
+  fputs("    b8g_statics[b8g_static_count].key = k;\n", out);
+  fputs("    b8g_statics[b8g_static_count].val = v;\n", out);
+  fputs("    b8g_static_count++;\n", out);
+  fputs("  }\n}\n", out);
+  fputs("static inline int64_t b8g_getstatic(uint16_t k) {\n", out);
+  fputs("  for (uint16_t i = 0; i < b8g_static_count; i++) {\n", out);
+  fputs("    if (b8g_statics[i].key == k) return b8g_statics[i].val;\n", out);
+  fputs("  }\n  return 0;\n}\n\n", out);
+
+  /* Forward declarations for methods with Code (static + <init> / instance) */
   int main_idx = -1;
   int main_has_args = 0;
   for (uint16_t i = 0; i < cls->methods_count; i++) {
     const b8g_method_t *m = &cls->methods[i];
-    if (!m->has_code || !(m->access_flags & JVM_ACC_STATIC)) continue;
+    if (!m->has_code) continue;
     if (m->name && strcmp(m->name, "<clinit>") == 0) continue;
     if (emit_method_sig(cls, i, out, 1) != 0) {
       aot_err(err, err_cap, "bad descriptor for method %s",
               m->name ? m->name : "<unknown>");
       return -1;
     }
-    if (m->name && strcmp(m->name, "main") == 0) {
+    if ((m->access_flags & JVM_ACC_STATIC) && m->name &&
+        strcmp(m->name, "main") == 0) {
       if (m->desc && strcmp(m->desc, "([Ljava/lang/String;)V") == 0) {
         main_idx = (int)i;
         main_has_args = 1;
@@ -713,7 +868,7 @@ int b8g_jvm_emit_c(const b8g_jvm_class_t *cls, FILE *out,
   /* Emit method bodies */
   for (uint16_t i = 0; i < cls->methods_count; i++) {
     const b8g_method_t *m = &cls->methods[i];
-    if (!m->has_code || !(m->access_flags & JVM_ACC_STATIC)) continue;
+    if (!m->has_code) continue;
     if (m->name && strcmp(m->name, "<clinit>") == 0) continue;
     if (emit_method_body(cls, i, out, err, err_cap) != 0) return -1;
   }
@@ -721,6 +876,8 @@ int b8g_jvm_emit_c(const b8g_jvm_class_t *cls, FILE *out,
   /* Emit C main() entrypoint */
   fputs("int main(void) {\n", out);
   fputs("  (void)b8g_aot_nanotime; (void)b8g_new_iarr; (void)b8g_new_barr;\n", out);
+  fputs("  (void)b8g_new_obj; (void)b8g_putfield; (void)b8g_getfield;\n", out);
+  fputs("  (void)b8g_putstatic; (void)b8g_getstatic;\n", out);
   if (main_idx >= 0) {
     char cname[128];
     sanitize_method_name(cls, (uint16_t)main_idx, cname, sizeof(cname));

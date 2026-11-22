@@ -43,6 +43,11 @@
 /* Sentinel pointer for java/lang/System.out */
 #define JVM_SYSTEM_OUT_REF  ((void *)(uintptr_t)0x57D007u)
 
+/* Bump-allocated object arena & static field table limits */
+#define B8G_JVM_MAX_OBJECTS     4096
+#define B8G_JVM_MAX_OBJ_FIELDS  16
+#define B8G_JVM_MAX_STATICS     256
+
 typedef struct {
   uint8_t tag;
   union {
@@ -106,8 +111,24 @@ typedef struct b8g_array {
 } b8g_array_t;
 
 typedef struct {
+  uint16_t class_idx;
+  uint8_t field_count;
+  uint16_t field_keys[B8G_JVM_MAX_OBJ_FIELDS];
+  int64_t field_vals[B8G_JVM_MAX_OBJ_FIELDS];
+} b8g_jvm_obj_t;
+
+typedef struct {
+  uint16_t key;
+  int64_t val;
+} b8g_jvm_static_t;
+
+typedef struct {
   const b8g_jvm_class_t *cls;
   b8g_array_t *heap_head;
+  b8g_jvm_obj_t *objects;
+  uint32_t obj_count;
+  b8g_jvm_static_t statics[B8G_JVM_MAX_STATICS];
+  uint16_t static_count;
   int call_depth;
   int max_call_depth;
   char err[256];
