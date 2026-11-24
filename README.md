@@ -109,3 +109,9 @@ zig cc -std=c11 -O3 -s Fib.c -o Fib.exe
 
 Part of the **`b8g-runtime`** (`sections/b8g-runtime/`), **Sectium** (`awesome-os/chromium.googlesource.com`), and **Awesome-OS** (`awesome-os/awesome-os`) sovereign systems stack — use `sectium-jvm` standalone for tiny zero-JDK bytecode execution and C11 AOT, or pair it with `b8g-runtime` for SHA-256 cached AOT builds and `B8G_ARENA_V1` shared-memory orchestration.
 
+## Quick Start (Windows / Linux / macOS)
+
+```sh
+# Clone & enter repository (all platforms)
+git clone https://github.com/awesome-os/sectium-jvm.git && cd sectium-jvm
+```
