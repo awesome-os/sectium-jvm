@@ -1,0 +1,52 @@
+{
+  "schema": "holo-compiler-lockfile-v1",
+  "abiMagic": "0x33564742",
+  "casLayout": "v11",
+  "repo": "awesome-os/sectium-jvm",
+  "targets": [
+    "win64",
+    "linux-x64",
+    "linux-arm64",
+    "macos-arm64",
+    "wasm32-wasi"
+  ],
+  "generatedAt": "2026-11-24T23:53:02.473Z",
+  "dependencies": [
+    {
+      "id": "awesome-os/sectium-jvm/sectium-jvm-v0.1.0.tar.zst",
+      "kind": "object",
+      "version": "v0.1.0",
+      "target": "any",
+      "sha512": "e7a895c292386ea1115805ad338725e5affd68f8261bf416dc335959c4415b91857d8773599c28184b35ecaa7e816cf677534a480daf613e47250f070c35a635",
+      "size": 29748,
+      "executable": false,
+      "blob": "v11/files/e7/e7a895c292386ea1115805ad338725e5affd68f8261bf416dc335959c4415b91857d8773599c28184b35ecaa7e816cf677534a480daf613e47250f070c35a635",
+      "url": "https://github.com/awesome-os/sectium-jvm/releases/download/v0.1.0/sectium-jvm-v0.1.0.tar.zst",
+      "dependencies": []
+    },
+    {
+      "id": "awesome-os/sectium-jvm/SHA256SUMS.txt",
+      "kind": "object",
+      "version": "v0.1.0",
+      "target": "any",
+      "sha512": "68dfbfdd336b20462e98e73bcbf5393d920444f393f50794557a05fd2024f65d4edddc0319f59d3c08558c336a77e5468b9e305e1d83c402a96495fad6eba5b0",
+      "size": 93,
+      "executable": false,
+      "blob": "v11/files/68/68dfbfdd336b20462e98e73bcbf5393d920444f393f50794557a05fd2024f65d4edddc0319f59d3c08558c336a77e5468b9e305e1d83c402a96495fad6eba5b0",
+      "url": "https://github.com/awesome-os/sectium-jvm/releases/download/v0.1.0/SHA256SUMS.txt",
+      "dependencies": []
+    },
+    {
+      "id": "awesome-os/sectium-jvm/SHA512SUMS.txt",
+      "kind": "object",
+      "version": "v0.1.0",
+      "target": "any",
+      "sha512": "cd91634acf15d52abfc9f82a13e8a52ad6e6fdb125526b104bbe60742260c497da697a1d28985d802f7f68c5e2575654abc7b09f2f741463c48057a32ee0ff25",
+      "size": 157,
+      "executable": false,
+      "blob": "v11/files/cd/cd91634acf15d52abfc9f82a13e8a52ad6e6fdb125526b104bbe60742260c497da697a1d28985d802f7f68c5e2575654abc7b09f2f741463c48057a32ee0ff25",
+      "url": "https://github.com/awesome-os/sectium-jvm/releases/download/v0.1.0/SHA512SUMS.txt",
+      "dependencies": []
+    }
+  ]
+}
