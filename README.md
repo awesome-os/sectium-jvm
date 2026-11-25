@@ -115,3 +115,13 @@ Part of the **`b8g-runtime`** (`sections/b8g-runtime/`), **Sectium** (`awesome-o
 # Clone & enter repository (all platforms)
 git clone https://github.com/awesome-os/sectium-jvm.git && cd sectium-jvm
 ```
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/sectium-jvm@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://cpp/sectium-jvm?from=repository://github.com/awesome-os/sectium-jvm@main"
+```
