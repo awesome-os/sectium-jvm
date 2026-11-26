@@ -1,3 +1,6 @@
+> [!NOTE]
+> Consolidated into the unified Holo v11 monorepo at https://github.com/awesome-os/awesome-os (all existing v11 CAS release assets remain downloadable).
+
 # sectium-jvm
 
 **`sectium-jvm`** (`awesome-os/sectium-jvm`) is a tiny, zero-JDK, pure-C11 JVM bytecode engine (`0xCAFEBABE`) with two execution tiers:
